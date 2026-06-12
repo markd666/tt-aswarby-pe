@@ -1,21 +1,22 @@
 <testsuites name="results">
   <testsuite name="all" package="all">
-    <property name="random_seed" value="1781259065" />
-    <testcase name="test_reset_zero" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="113" time="0.002377748489379883" sim_time_ns="100.0" ratio_time="42056.59280056151" />
-    <testcase name="test_basic_mac" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="120" time="0.008011817932128906" sim_time_ns="630.0" ratio_time="78633.83882871087" />
-    <testcase name="test_signed" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="132" time="0.009461641311645508" sim_time_ns="740.0" ratio_time="78210.53193901978" />
-    <testcase name="test_clear_resets_ovf" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="146" time="0.005478620529174805" sim_time_ns="440.0" ratio_time="80312.1876495931" />
-    <testcase name="test_v2_opcodes_dont_touch_mac_state" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="157" time="0.01658940315246582" sim_time_ns="1270.0" ratio_time="76554.89400842183" />
-    <testcase name="test_random_sequence" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="176" time="0.28699588775634766" sim_time_ns="22680.0" ratio_time="79025.52255123165" />
-    <testcase name="test_emit_basic_requant" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="218" time="0.035146236419677734" sim_time_ns="2920.0" ratio_time="83081.44192546162" />
-    <testcase name="test_emit_relu_relu6_bounds" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="241" time="0.024837493896484375" sim_time_ns="2100.0" ratio_time="84549.59299646752" />
-    <testcase name="test_random_layers_vs_golden" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="259" time="0.8120002746582031" sim_time_ns="67410.0" ratio_time="83017.21329881942" />
-    <testcase name="test_hardswish_sweep_vs_golden" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="291" time="4.130379676818848" sim_time_ns="343760.0" ratio_time="83227.21563087839" />
-    <testcase name="test_cfg_pointer_resets_on_other_commands" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="327" time="0.029656410217285156" sim_time_ns="2490.0" ratio_time="83961.61173103515" />
-    <testcase name="test_positive_saturation" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="349" time="0" sim_time_ns="0" ratio_time="0">
+    <property name="random_seed" value="1781267516" />
+    <testcase name="test_reset_zero" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="113" time="0.0024607181549072266" sim_time_ns="100.0" ratio_time="40638.542776862705" />
+    <testcase name="test_basic_mac" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="120" time="0.008176803588867188" sim_time_ns="630.0" ratio_time="77047.22183344996" />
+    <testcase name="test_signed" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="132" time="0.00998830795288086" sim_time_ns="740.0" ratio_time="74086.62242803266" />
+    <testcase name="test_clear_resets_ovf" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="146" time="0.005748271942138672" sim_time_ns="440.0" ratio_time="76544.74326005807" />
+    <testcase name="test_v2_opcodes_dont_touch_mac_state" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="157" time="0.016163110733032227" sim_time_ns="1270.0" ratio_time="78573.9837446344" />
+    <testcase name="test_random_sequence" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="176" time="0.2959322929382324" sim_time_ns="22680.0" ratio_time="76639.15206690138" />
+    <testcase name="test_emit_basic_requant" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="218" time="0.035904645919799805" sim_time_ns="2920.0" ratio_time="81326.52266011488" />
+    <testcase name="test_emit_relu_relu6_bounds" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="241" time="0.02531290054321289" sim_time_ns="2100.0" ratio_time="82961.6501836677" />
+    <testcase name="test_random_layers_vs_golden" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="259" time="0.8192954063415527" sim_time_ns="67410.0" ratio_time="82278.01532662044" />
+    <testcase name="test_hardswish_sweep_vs_golden" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="291" time="4.18760871887207" sim_time_ns="343760.0" ratio_time="82089.8090241324" />
+    <testcase name="test_cfg_pointer_resets_on_other_commands" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="327" time="0.030284643173217773" sim_time_ns="2490.0" ratio_time="82219.88899648095" />
+    <testcase name="test_real_layer_vectors" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="352" time="1.3648507595062256" sim_time_ns="112190.00000000006" ratio_time="82199.46336153855" />
+    <testcase name="test_positive_saturation" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="382" time="0" sim_time_ns="0" ratio_time="0">
       <skipped />
     </testcase>
-    <testcase name="test_negative_saturation" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="377" time="0" sim_time_ns="0" ratio_time="0">
+    <testcase name="test_negative_saturation" classname="test" file="/home/mark/code/tt-aswarby-pe/test/test.py" lineno="410" time="0" sim_time_ns="0" ratio_time="0">
       <skipped />
     </testcase>
   </testsuite>

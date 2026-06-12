@@ -346,6 +346,39 @@ async def test_cfg_pointer_resets_on_other_commands(dut):
     assert await read_result(dut) == gold.emit()
 
 
+_VECTORS = os.path.join(os.path.dirname(__file__), "vectors", "v5p2_layer0.json")
+
+
+@cocotb.test(skip=not os.path.exists(_VECTORS))
+async def test_real_layer_vectors(dut):
+    """Replay a quantized layer of the deployed v5.2 SAR ship detector.
+
+    test/vectors/v5p2_layer0.json (tools/export_layer_vectors.py) carries the
+    LOAD_CFG block and, per real output pixel, the exact (LOAD_W, MAC) stream
+    — conv weights x SAR pixels plus bias-correction terms — and the golden
+    model's expected int8 EMIT result. The same file later replays on the TT
+    FPGA breakout and the sky130 silicon via the demoboard SDK."""
+    import json
+
+    with open(_VECTORS) as f:
+        vec = json.load(f)
+    await reset(dut)
+    await op(dut, CMD_NOP)                      # reset cfg write pointer
+    for b in vec["cfg_bytes"]:
+        await op(dut, CMD_LOAD_CFG, b if b < 128 else b - 256)
+    for i, px in enumerate(vec["pixels"]):
+        await op(dut, CMD_CLEAR)
+        for w, a in px["ops"]:
+            await op(dut, CMD_LOADW, w)
+            await op(dut, CMD_MAC, a)
+        await op(dut, CMD_EMIT)
+        got = await read_result(dut)
+        assert got == px["expected"], (
+            f"pixel {i}: DUT {got} != golden {px['expected']} "
+            f"(float ref {px['float_ref_q']})"
+        )
+
+
 @cocotb.test(skip=_SKIP_SLOW)
 async def test_positive_saturation(dut):
     # weight=-128, data=-128 -> +16384 per MAC. 2^31 / 2^14 = 131072 MACs lands
