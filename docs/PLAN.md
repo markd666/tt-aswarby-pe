@@ -1,4 +1,26 @@
-# v2 Tiny Tapeout plan — `tt_um_aswarby_pe` (INT8 PE: MAC + requantize + activation)
+# v2 Tiny Tapeout plan — `tt_um_aswarby_pe`
+
+## STATUS (updated 2026-06-12 end of day)
+
+P0–P3 COMPLETE; design is submittable. All four TT gates green on sky130.
+
+| Gate | Outcome |
+|------|---------|
+| G1 (baseline) | v1 MAC on 1x2: 37.3% util, all corners clean |
+| G2 (fit) | Parallel datapath FAILED at 241% of 1x2 -> rewritten sequential (7,326 -> 2,690 cells) -> 103% of 1x2 -> **2x2 tiles (~€280), 53.2% util** |
+| G3 (B in/out) | **Hard-Swish IS IN** — sequential engine made it ~free (3 states + reuse) |
+| Timing | tt/ff corners clean; ss-only setup WNS -0.54 ns ACCEPTED as warning (v1 precedent was -1.57; failure mode = EMIT glitch at 1.60V+100C+slow die, recoverable by 45 MHz host clock) |
+| Verification | cocotb 13/13 vs frozen golden model (incl. both saturation sweeps) |
+
+Remaining: P4 FPGA bring-up (blocked on FPGA kit + demoboard purchase);
+P5 real-layer vector export + submission when the shuttle opens (July).
+Two findings for the portfolio narrative: (1) v1 = pipeline the multiply
+(process too slow); v2 = serialize the multiply (tile too small) — same
+primitive, opposite constraint, both learned from harden reports.
+(2) The $signed() concat bug — caught by golden-model equivalence tests.
+
+---
+
 
 **Created 2026-06-12. Target: SkyWater sky130 shuttle — opens July 2026, tapes out September (app deadline ~2026-09-07, confirm exact date + `tt-gds-action` tag when the shuttle opens in the TT app).**
 

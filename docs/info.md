@@ -29,7 +29,11 @@ one operation), 3-bit command on `uio[2:0]`:
 
 The MAC multiply is split into nibble half-products over a 4-stage pipeline
 (carried over from the GF180 design, where a single-cycle 8×8 multiply could
-not close timing); `done` (`uio[6]`) pulses when each operation commits.
+not close timing). EMIT runs a fully sequential engine — one 48-bit adder
+performs the shift-add multiplies, rounding and negation over up to ~160
+cycles (~3 µs at 50 MHz), which is what lets the whole PE plus Hard-Swish fit
+the tile budget. `done` (`uio[6]`) pulses when each operation commits
+(fixed 6 cycles for quick ops, completion-based for EMIT).
 `uio[7]` is a sticky saturation flag. The accumulator is readable
 byte-by-byte via `uio[5:4]` for debug.
 
