@@ -80,6 +80,7 @@ module pe_requant (
   reg        [3:0]  mcnt;    // multiply iteration counter (16 per pass)
   reg        [5:0]  scnt;    // shift counter (s-1 right shifts)
   reg               tneg;    // sign of t, applied after rounding
+  reg signed [34:0] r_q;     // signed rounded result, registered in S_SIGN
 
   // ---- activation registers -----------------------------------------------------
   reg signed [7:0]  q_lin;   // clamp(r + zp, -128, 127)
@@ -91,14 +92,16 @@ module pe_requant (
   wire signed [47:0] t_add = t_q + a_sh;          // the one real adder
   wire signed [47:0] t_neg = -t_q;
 
-  // r = +/- t after rounding; |r| < 2^33 by construction (s >= 15)
+  // r = +/- t after rounding; |r| < 2^33 by construction (s >= 15).
+  // Registered in S_SIGN so the negate doesn't chain into the zp-add and
+  // clamp comparisons below (that combined path was the ss-corner WNS).
   wire signed [34:0] r_w  = tneg ? -$signed({1'b0, t_q[33:0]})
                                  :  $signed({1'b0, t_q[33:0]});
 
   // q = clamp(r + zp, -128, 127). $signed() on the concat is load-bearing: a
   // bare concat is unsigned and would force the whole addition unsigned,
   // zero-extending a negative r into a huge positive value.
-  wire signed [35:0] r_zp = r_w + $signed({{28{zp[7]}}, zp});
+  wire signed [35:0] r_zp = r_q + $signed({{28{zp[7]}}, zp});
   wire signed [7:0]  q_w  = (r_zp < -36'sd128) ? -8'sd128 :
                             (r_zp >  36'sd127) ?  8'sd127 : r_zp[7:0];
 
@@ -129,6 +132,7 @@ module pe_requant (
       mcnt      <= 4'd0;
       scnt      <= 6'd0;
       tneg      <= 1'b0;
+      r_q       <= 35'sd0;
       q_lin     <= 8'sd0;
       u_q       <= 10'sd0;
       v_q       <= 8'd0;
@@ -181,7 +185,10 @@ module pe_requant (
           state <= S_SIGN;
         end
 
-        S_SIGN: state <= S_Q;    // r_w mux applies the sign combinationally
+        S_SIGN: begin
+          r_q   <= r_w;          // register: keeps negate out of the S_Q path
+          state <= S_Q;
+        end
 
         S_Q: begin
           if (pass == PASS_HS) begin
