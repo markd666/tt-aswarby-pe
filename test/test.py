@@ -81,10 +81,11 @@ async def op(dut, cmd, data=0):
     dut.uio_in.value = uio_inputs(cmd=cmd, strobe=0)
     await ClockCycles(dut.clk, 1)
     dut.uio_in.value = uio_inputs(cmd=cmd, strobe=1)
-    # Wait for the done pulse; bounded so a hang fails loudly. DONE_DELAY is
-    # 18 in v2 (sized for EMIT+hard-swish), hence the wider window than v1.
+    # Wait for the done pulse; bounded so a hang fails loudly. Quick ops
+    # complete in 6 cycles; EMIT runs the sequential engine (worst ~160
+    # cycles for hard-swish with maximum shift counts).
     seen_done = False
-    for _ in range(28):
+    for _ in range(220):
         await ClockCycles(dut.clk, 1)
         if done_flag(dut):
             seen_done = True

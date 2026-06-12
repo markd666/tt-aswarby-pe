@@ -1,5 +1,5 @@
 /*
- * pe_requant - EMIT engine: Q15 requantize + fused activation
+ * pe_requant - EMIT engine: Q15 requantize + fused activation (sequential)
  *
  * Implements GoldenPe.emit() from model/pe_golden.py bit-for-bit:
  *
@@ -9,18 +9,23 @@
  *        | clamp( rha(u*v*MHS >> 15+NHS) + ZP, -128, 127 ) (ACT_HSWISH)
  *          where u = q - ZP,  v = clamp(u + Q3, 0, Q6)
  *
- * Micro-architecture: ONE shared 48-bit "scale unit" — split 16x16 multiplies
- * (one cycle), 48-bit combine (one cycle), negate+round-bias add (one cycle),
- * variable barrel shift (one cycle), sign restore (one cycle) — sequenced
- * twice for hard-swish: pass 1 scales acc by M0, pass 2 scales p = u*v
- * (sign-extended to 32 bits) by MHS through the exact same hardware. Each
- * stage is kept to roughly one adder/mux depth: the v1 lesson (pipeline the
- * multiply from day one) applied to the bigger 32x16.
+ * Micro-architecture: fully SEQUENTIAL. The first version of this module
+ * instantiated two parallel 17x17 multipliers and a 48-bit barrel shifter;
+ * yosys maps a single 17x17 to ~2,000 cells, and the module hardened at
+ * 241% utilization of the 1x2 tile. Operations are strobe-paced by the
+ * host, so multiplier latency is worthless here — everything now runs
+ * through ONE 48-bit adder:
  *
- * Latency from `start`: 7 cycles (clamp activation), 14 cycles (hard-swish).
- * The top-level DONE_DELAY (16) covers both; ops are strobe-paced so
- * throughput is irrelevant. `acc` and the overflow flag are NOT modified —
- * EMIT is repeatable with different configs against the same accumulation.
+ *   - multiply  : 16 shift-add iterations (M examined LSB-first, A doubling)
+ *   - rounding  : (|t| + 2^(s-1)) >> s computed as |t| >> (s-1), +1, >> 1
+ *                 (exact identity, no bias decoder / barrel shifter needed)
+ *   - negate    : through the same adder (0 - x)
+ *
+ * The engine runs once for the requantize (acc x M0) and, for hard-swish,
+ * twice more (u x v, then p x MHS). Worst-case EMIT latency is ~180 cycles
+ * (~3.6 us at 50 MHz) — irrelevant against an RP2040 host strobing commands.
+ * `done` for EMIT is completion-based (top level), not a fixed delay.
+ * `acc` and the overflow flag are NOT modified — EMIT is repeatable.
  *
  * Copyright (c) 2026 Mark Shilton
  * SPDX-License-Identifier: Apache-2.0
@@ -33,7 +38,6 @@ module pe_requant (
     input  wire        rst_n,
     input  wire        start,     // one-cycle pulse: begin EMIT of `acc`
     input  wire [31:0] acc,       // accumulator (signed)
-    // configuration (pe_cfg outputs, stable while an op is in flight)
     input  wire [15:0] m0,
     input  wire [4:0]  n,
     input  wire        act,       // 0 clamp / 1 hard-swish
@@ -48,60 +52,55 @@ module pe_requant (
     output reg         result_we  // one-cycle pulse when `result` is written
 );
 
-  // ---- sequencer states ----------------------------------------------------
-  localparam [3:0] S_IDLE  = 4'd0,
-                   S_MUL   = 4'd1,   // scale-unit stage 1: half products
-                   S_COMB  = 4'd2,   // stage 2: 48-bit combine
-                   S_BIAS  = 4'd3,   // stage 3: |t| + rounding bias
-                   S_SHIFT = 4'd4,   // stage 4: barrel shift
-                   S_SIGN  = 4'd5,   // stage 5: sign restore -> r
-                   S_Q     = 4'd6,   // q = clamp(r + zp, -128, 127); clamp-act finishes
-                   S_UV    = 4'd7,   // hard-swish: u, v
-                   S_P     = 4'd8,   // hard-swish: p = u*v; reload scale unit
-                   S_OUT   = 4'd9;   // hard-swish: result = clamp(r2 + zp)
+  // ---- sequencer ------------------------------------------------------------
+  localparam [3:0] S_IDLE   = 4'd0,
+                   S_MUL    = 4'd1,   // 16 shift-add iterations: t += m[0]?a:0
+                   S_ABS    = 4'd2,   // t < 0 ? -t : t (sign remembered)
+                   S_SHR    = 4'd3,   // (s-1) arithmetic right shifts of |t|
+                   S_INC    = 4'd4,   // +1 (the rounding-half bit)
+                   S_SHR1   = 4'd5,   // final >> 1
+                   S_SIGN   = 4'd6,   // restore sign -> r
+                   S_Q      = 4'd7,   // q = clamp(r+zp); clamp-act finishes here
+                   S_UV     = 4'd8,   // hard-swish: u, v
+                   S_LOADP  = 4'd9,   // start u*v multiply (pass: P)
+                   S_LOADHS = 4'd10,  // start p*MHS multiply (pass: HS)
+                   S_OUT    = 4'd11;  // result = clamp(r2 + zp)
+
+  localparam [1:0] PASS_REQ = 2'd0,   // acc * M0   >> 15+n
+                   PASS_P   = 2'd1,   // u * v      (no shift, raw product)
+                   PASS_HS  = 2'd2;   // p * MHS    >> 15+nhs
 
   reg [3:0] state;
-  reg       pass2;     // 0 = scaling acc by M0, 1 = scaling p by MHS
+  reg [1:0] pass;
 
-  // ---- scale-unit operand registers -----------------------------------------
-  reg signed [31:0] a_q;     // value being scaled
-  reg        [15:0] m_q;     // Q15 mantissa
-  reg        [5:0]  s_q;     // total right shift (15 + n), 15..46
+  // ---- engine registers -------------------------------------------------------
+  reg signed [47:0] t_q;     // accumulator / working register
+  reg signed [47:0] a_sh;    // multiplicand, doubling each iteration
+  reg        [15:0] m_sh;    // multiplier bits, LSB-first
+  reg        [3:0]  mcnt;    // multiply iteration counter (16 per pass)
+  reg        [5:0]  scnt;    // shift counter (s-1 right shifts)
+  reg               tneg;    // sign of t, applied after rounding
 
-  // ---- scale-unit pipeline registers ----------------------------------------
-  reg signed [32:0] ph_q;    // A[31:16] * M   (17s x 17s)
-  reg signed [32:0] pl_q;    // A[15:0]  * M   (zero-extended x 17s)
-  reg signed [47:0] t_q;     // full product A*M  (|t| < 2^47)
-  reg               tneg_q;  // sign of t, carried past the abs
-  reg        [47:0] tb_q;    // |t| + (1 << (s-1))
-  reg        [47:0] sh_q;    // tb >> s
-  reg signed [33:0] r_q;     // signed rounded result (|r| < 2^33)
-
-  // ---- activation registers --------------------------------------------------
+  // ---- activation registers -----------------------------------------------------
   reg signed [7:0]  q_lin;   // clamp(r + zp, -128, 127)
   reg signed [9:0]  u_q;     // q - zp  in [-255, 255]
   reg        [7:0]  v_q;     // clamp(u + q3, 0, q6)
   reg signed [17:0] p_q;     // u * v   in [-65025, 65025]
 
-  // ---- combinational helpers --------------------------------------------------
-  wire signed [16:0] a_hi  = {a_q[31], a_q[31:16]};      // sign-extended high half
-  wire signed [16:0] a_lo  = {1'b0, a_q[15:0]};          // unsigned low half
-  wire signed [16:0] m_s   = {1'b0, m_q};                // mantissa, always positive
+  // ---- shared combinational helpers ----------------------------------------------
+  wire signed [47:0] t_add = t_q + a_sh;          // the one real adder
+  wire signed [47:0] t_neg = -t_q;
 
-  wire signed [47:0] t_w   = (ph_q <<< 16) + pl_q;
+  // r = +/- t after rounding; |r| < 2^33 by construction (s >= 15)
+  wire signed [34:0] r_w  = tneg ? -$signed({1'b0, t_q[33:0]})
+                                 :  $signed({1'b0, t_q[33:0]});
 
-  wire        [47:0] t_abs = t_q[47] ? (~t_q + 48'd1) : t_q;
-  wire        [47:0] bias  = 48'd1 << (s_q - 6'd1);      // s >= 15, so s-1 >= 14
-
-  wire signed [33:0] r_pos = $signed({1'b0, sh_q[32:0]});
-  wire signed [33:0] r_w   = tneg_q ? -r_pos : r_pos;
-
-  // q = clamp(r + zp, -128, 127). The $signed() on the concat is load-bearing:
-  // a bare concatenation is unsigned and would force the whole addition
-  // unsigned, zero-extending a negative r_q into a huge positive value.
-  wire signed [34:0] r_zp  = r_q + $signed({{27{zp[7]}}, zp});
-  wire signed [7:0]  q_w   = (r_zp < -35'sd128) ? -8'sd128 :
-                             (r_zp >  35'sd127) ?  8'sd127 : r_zp[7:0];
+  // q = clamp(r + zp, -128, 127). $signed() on the concat is load-bearing: a
+  // bare concat is unsigned and would force the whole addition unsigned,
+  // zero-extending a negative r into a huge positive value.
+  wire signed [35:0] r_zp = r_w + $signed({{28{zp[7]}}, zp});
+  wire signed [7:0]  q_w  = (r_zp < -36'sd128) ? -8'sd128 :
+                            (r_zp >  36'sd127) ?  8'sd127 : r_zp[7:0];
 
   // clamp activation: lower bound checked first (matches GoldenPe.clamp)
   wire signed [7:0] qmin_s = qmin;
@@ -109,28 +108,27 @@ module pe_requant (
   wire signed [7:0] out_clamp = (q_w < qmin_s) ? qmin_s :
                                 (q_w > qmax_s) ? qmax_s : q_w;
 
-  // hard-swish helpers
-  wire signed [9:0]  u_w   = {{2{q_lin[7]}}, q_lin} - {{2{zp[7]}}, zp};
-  wire signed [10:0] uq3   = {u_w[9], u_w} + {3'b000, q3};
-  wire        [7:0]  v_w   = uq3[10]                       ? 8'd0 :
-                             (uq3 > {3'b000, q6})          ? q6   : uq3[7:0];
+  // hard-swish helpers (width-exact: bit patterns are signedness-safe)
+  wire signed [9:0]  u_w = {{2{q_lin[7]}}, q_lin} - {{2{zp[7]}}, zp};
+  wire signed [10:0] uq3 = {u_w[9], u_w} + {3'b000, q3};
+  wire        [7:0]  v_w = uq3[10]              ? 8'd0 :
+                           (uq3 > {3'b000, q6}) ? q6   : uq3[7:0];
+
+  // shift count for the current scaling pass (s = 15 + n; we shift s-1, +1, >>1)
+  wire [5:0] s_total = 6'd15 + {1'b0, (pass == PASS_REQ) ? n : nhs};
 
   always @(posedge clk) begin
     if (!rst_n) begin
       state     <= S_IDLE;
-      pass2     <= 1'b0;
+      pass      <= PASS_REQ;
       result    <= 8'd0;
       result_we <= 1'b0;
-      a_q       <= 32'sd0;
-      m_q       <= 16'd0;
-      s_q       <= 6'd0;
-      ph_q      <= 33'sd0;
-      pl_q      <= 33'sd0;
       t_q       <= 48'sd0;
-      tneg_q    <= 1'b0;
-      tb_q      <= 48'd0;
-      sh_q      <= 48'd0;
-      r_q       <= 34'sd0;
+      a_sh      <= 48'sd0;
+      m_sh      <= 16'd0;
+      mcnt      <= 4'd0;
+      scnt      <= 6'd0;
+      tneg      <= 1'b0;
       q_lin     <= 8'sd0;
       u_q       <= 10'sd0;
       v_q       <= 8'd0;
@@ -140,43 +138,54 @@ module pe_requant (
 
       case (state)
         S_IDLE: if (start) begin
-          a_q   <= acc;
-          m_q   <= m0;
-          s_q   <= 6'd15 + {1'b0, n};
-          pass2 <= 1'b0;
+          t_q   <= 48'sd0;
+          a_sh  <= {{16{acc[31]}}, acc};
+          m_sh  <= m0;
+          mcnt  <= 4'd0;
+          pass  <= PASS_REQ;
           state <= S_MUL;
         end
 
         S_MUL: begin
-          ph_q  <= a_hi * m_s;
-          pl_q  <= a_lo * m_s;
-          state <= S_COMB;
+          if (m_sh[0])
+            t_q <= t_add;
+          a_sh <= a_sh <<< 1;
+          m_sh <= m_sh >> 1;
+          mcnt <= mcnt + 4'd1;
+          if (mcnt == 4'd15)
+            state <= (pass == PASS_P) ? S_LOADHS : S_ABS;
         end
 
-        S_COMB: begin
-          t_q   <= t_w;
-          state <= S_BIAS;
+        S_ABS: begin
+          tneg  <= t_q[47];
+          if (t_q[47])
+            t_q <= t_neg;
+          scnt  <= s_total - 6'd1;
+          state <= S_SHR;
         end
 
-        S_BIAS: begin
-          tneg_q <= t_q[47];
-          tb_q   <= t_abs + bias;
-          state  <= S_SHIFT;
+        S_SHR: begin
+          t_q  <= t_q >>> 1;     // |t| is non-negative; >>> keeps widths tidy
+          scnt <= scnt - 6'd1;
+          if (scnt == 6'd1)
+            state <= S_INC;
         end
 
-        S_SHIFT: begin
-          sh_q  <= tb_q >> s_q;
+        S_INC: begin
+          t_q   <= t_q + 48'sd1;
+          state <= S_SHR1;
+        end
+
+        S_SHR1: begin
+          t_q   <= t_q >>> 1;
           state <= S_SIGN;
         end
 
-        S_SIGN: begin
-          r_q   <= r_w;
-          state <= S_Q;
-        end
+        S_SIGN: state <= S_Q;    // r_w mux applies the sign combinationally
 
         S_Q: begin
-          if (pass2) begin
-            // hard-swish pass 2 complete: r is the scaled u*v*MHS
+          if (pass == PASS_HS) begin
+            // hard-swish pass complete: r is the scaled u*v*MHS
             result    <= q_w;          // clamp(r2 + zp, -128, 127)
             result_we <= 1'b1;
             state     <= S_IDLE;
@@ -193,26 +202,38 @@ module pe_requant (
         S_UV: begin
           u_q   <= u_w;
           v_q   <= v_w;
-          state <= S_P;
+          state <= S_LOADP;
         end
 
-        S_P: begin
-          p_q   <= u_q * $signed({1'b0, v_q});
-          state <= S_OUT;
-        end
-
-        S_OUT: begin
-          // reload the scale unit for pass 2: p sign-extended to 32 bits
-          a_q   <= {{14{p_q[17]}}, p_q};
-          m_q   <= mhs;
-          s_q   <= 6'd15 + {1'b0, nhs};
-          pass2 <= 1'b1;
+        S_LOADP: begin
+          // multiply u by v through the engine: A = u, M = v (zero-extended)
+          t_q   <= 48'sd0;
+          a_sh  <= {{38{u_q[9]}}, u_q};
+          m_sh  <= {8'd0, v_q};
+          mcnt  <= 4'd0;
+          pass  <= PASS_P;
           state <= S_MUL;
         end
+
+        S_LOADHS: begin
+          // p = u*v just finished in t_q (raw, unshifted); scale it by MHS
+          p_q   <= t_q[17:0];
+          t_q   <= 48'sd0;
+          a_sh  <= {{30{t_q[17]}}, t_q[17:0]};
+          m_sh  <= mhs;
+          mcnt  <= 4'd0;
+          pass  <= PASS_HS;
+          state <= S_MUL;
+        end
+
+        S_OUT: state <= S_IDLE;  // unreachable; retained for completeness
 
         default: state <= S_IDLE;
       endcase
     end
   end
+
+  // p_q is kept only for waveform debugging; silence the unused warning.
+  wire _unused = &{p_q, 1'b0};
 
 endmodule

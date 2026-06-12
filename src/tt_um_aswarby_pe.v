@@ -18,7 +18,9 @@
  *   uo_out[7:0]  accumulator byte view (rd_sel, LSB-first) — switches to the
  *                EMIT result after an EMIT completes, and back to the
  *                accumulator view on the next strobed command of any kind
- *   uio_out[6]   done     : one-cycle completion pulse (fixed latency, all ops)
+ *   uio_out[6]   done     : one-cycle completion pulse (fixed 6-cycle latency
+ *                           for MAC/LOADW/CLEAR/LOAD_CFG/NOP; completion-based
+ *                           for EMIT — up to ~160 cycles, sequential engine)
  *   uio_out[7]   ovf      : sticky saturation flag (cleared by clear/reset)
  *
  * Copyright (c) 2026 Mark Shilton
@@ -48,20 +50,37 @@ module tt_um_aswarby_pe (
   wire        do_op;
   wire        done;
   wire        ovf;
+  wire        result_we;
   wire [7:0]  rd_byte;
   wire [31:0] acc;
 
-  // DONE_DELAY covers the slowest operation: EMIT with hard-swish writes its
-  // result 16 cycles after do_op (pe_requant header); 18 adds safe margin.
+  // Fixed-delay done for the quick ops (MAC commits 4 cycles after do_op).
+  // EMIT runs the sequential pe_requant engine (up to ~160 cycles), so its
+  // done is completion-based: the result_we pulse, delayed one cycle.
+  wire sr_done;
   mac_fsm #(
-      .DONE_DELAY(18)
+      .DONE_DELAY(6)
   ) u_fsm (
       .clk   (clk),
       .rst_n (rst_n),
       .strobe(strobe),
       .do_op (do_op),
-      .done  (done)
+      .done  (sr_done)
   );
+
+  reg was_emit;
+  reg emit_done_d;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      was_emit    <= 1'b0;
+      emit_done_d <= 1'b0;
+    end else begin
+      if (do_op) was_emit <= is_emit;
+      emit_done_d <= result_we;
+    end
+  end
+
+  assign done = was_emit ? emit_done_d : sr_done;
 
   // cmd[1:0] of the v2 opcodes 000..011 match the v1 encoding exactly, so the
   // core is reused untouched. Gating do_op on !cmd[2] keeps the v2 opcodes
@@ -102,7 +121,6 @@ module tt_um_aswarby_pe (
   );
 
   wire [7:0] result;
-  wire       result_we;
 
   pe_requant u_requant (
       .clk      (clk),
