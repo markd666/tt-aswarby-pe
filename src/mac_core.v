@@ -33,6 +33,7 @@ module mac_core (
     input  wire [7:0]  data,     // signed INT8 operand (weight or activation)
     input  wire [1:0]  rd_sel,   // which accumulator byte appears on rd_byte
     output wire [7:0]  rd_byte,  // selected accumulator byte (combinational)
+    output wire [31:0] acc_out,  // full accumulator (v2: feeds pe_requant EMIT)
     output wire        ovf       // sticky: accumulator has saturated since clear
 );
 
@@ -115,6 +116,7 @@ module mac_core (
                    (rd_sel == 2'd2) ? acc[23:16] :
                                       acc[31:24];
 
+  assign acc_out = acc;
   assign ovf = ovf_sticky;
 
 endmodule

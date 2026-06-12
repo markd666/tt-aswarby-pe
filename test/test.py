@@ -20,7 +20,15 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
-from pe_golden import INT32_MAX, INT32_MIN, GoldenPe  # noqa: E402
+from pe_golden import (  # noqa: E402
+    ACT_CLAMP,
+    ACT_HSWISH,
+    INT32_MAX,
+    INT32_MIN,
+    GoldenPe,
+    hswish_params,
+    quantize_multiplier_q15,
+)
 
 # Exhaustive saturation sweeps are minutes-long at RTL and unusable at gate
 # level, so they always skip under gate-level sim (GATES=yes) and can be
@@ -73,9 +81,10 @@ async def op(dut, cmd, data=0):
     dut.uio_in.value = uio_inputs(cmd=cmd, strobe=0)
     await ClockCycles(dut.clk, 1)
     dut.uio_in.value = uio_inputs(cmd=cmd, strobe=1)
-    # Wait for the done pulse; bounded so a hang fails loudly.
+    # Wait for the done pulse; bounded so a hang fails loudly. DONE_DELAY is
+    # 18 in v2 (sized for EMIT+hard-swish), hence the wider window than v1.
     seen_done = False
-    for _ in range(16):
+    for _ in range(28):
         await ClockCycles(dut.clk, 1)
         if done_flag(dut):
             seen_done = True
@@ -145,15 +154,19 @@ async def test_clear_resets_ovf(dut):
 
 
 @cocotb.test()
-async def test_v2_opcodes_inert_in_p1(dut):
-    """LOAD_CFG/EMIT must pulse done but leave MAC state untouched — and EMIT
-    (101) must NOT alias into LOADW (01) inside the core (the cmd[2] gate)."""
+async def test_v2_opcodes_dont_touch_mac_state(dut):
+    """LOAD_CFG/EMIT must leave MAC state untouched — and EMIT (101) must NOT
+    alias into LOADW (01) inside the core (the cmd[2] gate). The NOP after
+    EMIT re-arms the accumulator view on uo_out (EMIT switches it to the
+    result register)."""
     await reset(dut)
     await op(dut, CMD_LOADW, 11)
     await op(dut, CMD_MAC, 10)               # acc = 110
     assert await read_acc(dut) == 110
     await op(dut, CMD_LOAD_CFG, 0x55)        # done pulses (asserted inside op)
+    await op(dut, CMD_NOP)                   # restart cfg pointer after stray write
     await op(dut, CMD_EMIT, 77)              # would clobber weight if aliased
+    await op(dut, CMD_NOP)                   # back to accumulator view
     assert await read_acc(dut) == 110        # acc untouched
     await op(dut, CMD_MAC, 10)               # weight must still be 11
     assert await read_acc(dut) == 220
@@ -181,6 +194,155 @@ async def test_random_sequence(dut):
             gold.clear()
         assert await read_acc(dut) == gold.acc, f"acc mismatch, expected {gold.acc}"
         assert ovf_flag(dut) == gold.ovf
+
+
+# ----------------------------------------------------------------------------
+# P2: LOAD_CFG + EMIT (requantize + activation)
+# ----------------------------------------------------------------------------
+async def load_cfg(dut, gold):
+    """Push the golden model's current config into the DUT byte-by-byte.
+    A leading NOP resets the cfg write pointer (the pe_cfg contract)."""
+    await op(dut, CMD_NOP)
+    for b in gold.cfg_bytes():
+        await op(dut, CMD_LOAD_CFG, b if b < 128 else b - 256)
+
+
+async def read_result(dut):
+    """uo_out shows the EMIT result until the next strobed command."""
+    await ClockCycles(dut.clk, 1)
+    v = int(dut.uo_out.value) & 0xFF
+    return v - 256 if v >= 128 else v
+
+
+@cocotb.test()
+async def test_emit_basic_requant(dut):
+    """Known config, small accumulation, clamp activation = passthrough."""
+    await reset(dut)
+    gold = GoldenPe()
+    gold.m0, gold.n = quantize_multiplier_q15(0.05)
+    gold.zp = -10
+    await load_cfg(dut, gold)
+    await op(dut, CMD_LOADW, 25)
+    gold.load_w(25)
+    for a in (40, 40, 33):
+        await op(dut, CMD_MAC, a)
+        gold.mac(a)
+    await op(dut, CMD_EMIT)
+    assert await read_result(dut) == gold.emit()   # 113*25*0.05 - 10 ~= 131 -> clamps
+    # result view drops back to the accumulator on the next command...
+    await op(dut, CMD_NOP)
+    assert await read_acc(dut) == gold.acc
+    # ...and EMIT is repeatable: acc was not consumed.
+    await op(dut, CMD_EMIT)
+    assert await read_result(dut) == gold.emit()
+
+
+@cocotb.test()
+async def test_emit_relu_relu6_bounds(dut):
+    """ReLU/ReLU6 as clamp bounds, negative accumulations clamp to zp."""
+    await reset(dut)
+    gold = GoldenPe()
+    gold.m0, gold.n = quantize_multiplier_q15(0.013)
+    gold.zp = -10
+    gold.qmin = gold.zp              # fused ReLU
+    gold.qmax = 127
+    await load_cfg(dut, gold)
+    await op(dut, CMD_LOADW, -100)
+    gold.load_w(-100)
+    await op(dut, CMD_MAC, 100)      # acc = -10000 -> well below zero
+    gold.mac(100)
+    await op(dut, CMD_EMIT)
+    assert await read_result(dut) == gold.emit() == gold.zp
+
+
+@cocotb.test()
+async def test_random_layers_vs_golden(dut):
+    """Randomized end-to-end micro-layers: cfg + MACs + EMIT vs GoldenPe."""
+    await reset(dut)
+    rng = random.Random(11)
+    for trial in range(25):
+        gold = GoldenPe()
+        gold.m0, gold.n = quantize_multiplier_q15(10 ** rng.uniform(-4, -1e-4))
+        gold.zp = rng.randint(-128, 127)
+        lo, hi = sorted((rng.randint(-128, 127), rng.randint(-128, 127)))
+        gold.qmin, gold.qmax = lo, hi
+        gold.act = ACT_CLAMP
+        await load_cfg(dut, gold)
+        await op(dut, CMD_CLEAR)
+        gold.clear()
+        w = rng.choice([rng.randint(-128, 127), -128, 127])
+        await op(dut, CMD_LOADW, w)
+        gold.load_w(w)
+        for _ in range(rng.randint(1, 10)):
+            a = rng.choice([rng.randint(-128, 127), -128, 127])
+            await op(dut, CMD_MAC, a)
+            gold.mac(a)
+        await op(dut, CMD_EMIT)
+        got = await read_result(dut)
+        want = gold.emit()
+        assert got == want, (
+            f"trial {trial}: emit {got} != golden {want} "
+            f"(acc={gold.acc} m0={gold.m0} n={gold.n} zp={gold.zp} "
+            f"qmin={gold.qmin} qmax={gold.qmax})"
+        )
+
+
+@cocotb.test()
+async def test_hardswish_sweep_vs_golden(dut):
+    """Hard-swish across the full int8 input range at three scales.
+
+    Identity requant trick: acc = 2*(q - zp) with m0 = 2^14, n = 0 makes the
+    linear point land exactly on q (no rounding ambiguity), so the sweep
+    isolates the activation datapath."""
+    await reset(dut)
+    for scale, zp in [(3 / 127, 0), (0.05, -20), (0.043, 5)]:
+        gold = GoldenPe()
+        gold.m0, gold.n = 1 << 14, 0
+        gold.zp = zp
+        gold.act = ACT_HSWISH
+        for k, v in hswish_params(scale, zp).items():
+            setattr(gold, k, v)
+        await load_cfg(dut, gold)
+        await op(dut, CMD_LOADW, 1)
+        gold.load_w(1)
+        for q in range(-128, 128, 3):       # step 3: 86 points per scale
+            target = 2 * (q - zp)           # |target| <= 510
+            await op(dut, CMD_CLEAR)
+            gold.clear()
+            rem = target                    # accumulate in int8-sized chunks
+            while rem != 0:
+                chunk = max(-128, min(127, rem))
+                await op(dut, CMD_MAC, chunk)
+                gold.mac(chunk)
+                rem -= chunk
+            await op(dut, CMD_EMIT)
+            got = await read_result(dut)
+            want = gold.emit()
+            assert got == want, (
+                f"hswish scale={scale} zp={zp} q={q}: {got} != {want}"
+            )
+
+
+@cocotb.test()
+async def test_cfg_pointer_resets_on_other_commands(dut):
+    """A partial cfg write followed by any other command restarts the pointer
+    at byte 0 — a stale pointer would corrupt M0 and skew the EMIT result."""
+    await reset(dut)
+    gold = GoldenPe()
+    gold.m0, gold.n = quantize_multiplier_q15(0.25)
+    gold.zp = 7
+    # Write garbage into the first three cfg slots, then abandon mid-block.
+    await op(dut, CMD_NOP)
+    for b in (0x12, 0x34, 0x1F):
+        await op(dut, CMD_LOAD_CFG, b)
+    # The full reload must land at byte 0 again (load_cfg NOPs first).
+    await load_cfg(dut, gold)
+    await op(dut, CMD_LOADW, 64)
+    gold.load_w(64)
+    await op(dut, CMD_MAC, 64)
+    gold.mac(64)
+    await op(dut, CMD_EMIT)
+    assert await read_result(dut) == gold.emit()
 
 
 @cocotb.test(skip=_SKIP_SLOW)

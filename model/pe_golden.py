@@ -115,6 +115,24 @@ class GoldenPe:
         self.acc = 0
         self.ovf = 0
 
+    def cfg_bytes(self):
+        """The 11 LOAD_CFG bytes encoding the current config registers, in
+        auto-increment order (the layout in the module docstring). This is the
+        canonical byte layout — the RTL decoder and any host SDK follow it."""
+        return [
+            self.m0 & 0xFF,
+            (self.m0 >> 8) & 0xFF,
+            ((self.act & 1) << 5) | (self.n & 31),
+            self.zp & 0xFF,
+            self.qmin & 0xFF,
+            self.qmax & 0xFF,
+            self.q3 & 0xFF,
+            self.q6 & 0xFF,
+            self.mhs & 0xFF,
+            (self.mhs >> 8) & 0xFF,
+            self.nhs & 31,
+        ]
+
     # ---- v2 requantize + activation ------------------------------------
     def requant_linear(self):
         """acc -> int8 linear point (pre-activation), saturating."""
